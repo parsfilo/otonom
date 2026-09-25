@@ -1,20 +1,16 @@
-name: OpenCode Free Smoke Test
+name: OpenCode Keyless Smoke Test
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   opencode-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
       - name: Install latest OpenCode
         shell: bash
         run: |
@@ -22,55 +18,83 @@ jobs:
 
           npm install --global @opencode/cli@latest
 
-          echo "OpenCode:"
+          echo "OpenCode version:"
           opencode --version
 
-      - name: Show available OpenCode models
+      - name: Show keyless available models
         shell: bash
         run: |
           set -euo pipefail
-          opencode models opencode --refresh || true
 
-      - name: Test free model without API key
+          echo "Models available without credentials:"
+          opencode models --standalone || true
+
+      - name: Run keyless free-model smoke test
         shell: bash
         run: |
           set -u
 
+          # No OPENCODE_API_KEY.
+          # OpenCode itself uses its public/free access path.
+
           MODELS=(
-            "opencode/deepseek-v4-flash-free"
-            "opencode/hy3-free"
             "opencode/mimo-v2.5-free"
+            "opencode/ling-3.0-flash-fin-free"
+            "opencode/nemotron-3.5-lightning-free"
+            "opencode/nemotron-3-ultra-free"
+            "opencode/muse-spark-1.3-contributor-free"
             "opencode/big-pickle"
           )
 
+          SUCCESS=0
+
           for MODEL in "${MODELS[@]}"; do
+            echo
             echo "========================================"
             echo "Testing: $MODEL"
             echo "========================================"
 
-            OUTPUT="$(
-              timeout 90s opencode run \
+            # IMPORTANT:
+            # Put the failing command inside an `if`.
+            # This prevents GitHub Actions' implicit `bash -e`
+            # from killing the job before fallback can run.
+            if OUTPUT="$(
+              timeout 60s opencode run \
                 --standalone \
                 --model "$MODEL" \
                 "Reply with exactly OPENCODE_OK and nothing else." \
                 2>&1
-            )"
-
-            STATUS=$?
+            )"; then
+              STATUS=0
+            else
+              STATUS=$?
+            fi
 
             echo "$OUTPUT"
 
             if [ "$STATUS" -eq 0 ] && grep -Fq "OPENCODE_OK" <<< "$OUTPUT"; then
-              echo ""
+              echo
               echo "✅ SUCCESS"
               echo "Model: $MODEL"
-              echo "No API key was used."
-              exit 0
+              echo "API key: NONE"
+              SUCCESS=1
+              break
             fi
 
-            echo "⚠️ $MODEL failed, trying next free model..."
-            echo ""
+            if [ "$STATUS" -eq 124 ]; then
+              echo "⚠️ Timeout: $MODEL"
+            else
+              echo "⚠️ Failed: $MODEL (exit=$STATUS)"
+            fi
           done
 
-          echo "::error::All free OpenCode models failed"
+          echo
+          echo "========================================"
+
+          if [ "$SUCCESS" -eq 1 ]; then
+            echo "✅ OpenCode keyless smoke test passed."
+            exit 0
+          fi
+
+          echo "::error::No keyless free OpenCode model responded successfully."
           exit 1
