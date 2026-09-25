@@ -3,14 +3,13 @@ name: OpenCode Keyless Free Model Test
 on:
   workflow_dispatch:
 
-# GitHub token'a bile ihtiyacımız yok.
 permissions: {}
 
 jobs:
   opencode-test:
     name: OpenCode Keyless Smoke Test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Install latest OpenCode
@@ -21,30 +20,29 @@ jobs:
           npm install --global @opencode/cli@latest
 
           echo "========================================"
-          echo "OpenCode version"
+          echo "VERSIONS"
           echo "========================================"
           opencode --version
-
-          echo
-          echo "Node:"
           node --version
-
-          echo
-          echo "jq:"
           jq --version
 
-      - name: Discover current free OpenCode models
+      - name: Discover zero-cost keyless OpenCode models
         id: models
         shell: bash
+        env:
+          NO_COLOR: "1"
         run: |
           set -euo pipefail
 
           CATALOG="$RUNNER_TEMP/models-dev.json"
           FREE="$RUNNER_TEMP/free-models.txt"
-          LIVE="$RUNNER_TEMP/live-models.txt"
+          AVAILABLE_FULL="$RUNNER_TEMP/opencode-models.txt"
+          AVAILABLE="$RUNNER_TEMP/opencode-model-ids.txt"
           CANDIDATES="$RUNNER_TEMP/candidates.txt"
 
-          echo "Downloading current Models.dev catalog..."
+          echo "========================================"
+          echo "1. DOWNLOAD MODELS.DEV CATALOG"
+          echo "========================================"
 
           curl \
             --fail \
@@ -58,49 +56,53 @@ jobs:
             "https://models.dev/api.json?type=all" \
             -o "$CATALOG"
 
-          # API yapısının beklediğimiz formatta olduğunu doğrula.
           jq -e '
-            .opencode.models
-            | type == "object"
+            (.opencode.models | type) == "object"
           ' "$CATALOG" >/dev/null
 
-          # Yalnızca:
-          #
-          # - OpenCode Zen modelleri
-          # - input = $0
-          # - output = $0
-          # - cost içindeki diğer sayısal alanlar da $0
-          # - deprecated olmayan
-          # - text output verebilen
-          # - özel "decision" modeli olmayan
-          #
-          # modelleri seç.
-          #
-          # Tool-call destekleyen ve context'i yüksek modeller önce gelir.
+          echo
+          echo "========================================"
+          echo "2. FIND COMPLETELY ZERO-COST MODELS"
+          echo "========================================"
+
           jq -r '
             .opencode.models
             | to_entries
 
             | map(
                 select(
+                  # Input/output explicitly zero.
                   (.value.cost.input? == 0)
                   and
                   (.value.cost.output? == 0)
+
+                  # reasoning/cache/audio/tier etc. dahil cost
+                  # altında bulunan TÜM sayısal ücretler sıfır olmalı.
                   and
                   (
-                    [.value.cost.. | numbers]
+                    [
+                      (.value.cost // {})
+                      | ..
+                      | numbers
+                    ]
                     | all(. == 0)
                   )
+
+                  # Deprecated modeli kullanma.
                   and
                   (
                     (.value.status? // "active")
                     != "deprecated"
                   )
+
+                  # Decision-only özel model kullanma.
                   and
                   (
                     (.value.type? // "")
                     != "decision"
                   )
+
+                  # Normal text response verebilmeli.
                   and
                   (
                     (
@@ -112,6 +114,7 @@ jobs:
                 )
               )
 
+            # Tool desteği olanları ve büyük context modellerini öne al.
             | sort_by(
                 [
                   (
@@ -127,95 +130,128 @@ jobs:
             | .[].key
           ' "$CATALOG" > "$FREE"
 
+          FREE_COUNT="$(grep -c . "$FREE" || true)"
+
+          echo "Models.dev zero-cost model count: $FREE_COUNT"
           echo
-          echo "========================================"
-          echo "FREE MODELS FROM MODELS.DEV"
-          echo "========================================"
 
           nl -ba "$FREE"
 
-          FREE_COUNT="$(wc -l < "$FREE" | tr -d ' ')"
-
-          echo
-          echo "Free model count: $FREE_COUNT"
-
           if [ "$FREE_COUNT" -eq 0 ]; then
-            echo "::error::Models.dev returned no zero-cost OpenCode models."
+            echo "::error::No completely zero-cost OpenCode models found."
             exit 1
           fi
 
-          # Zen'in canlı /models endpointi açıksa,
-          # katalogdaki ücretsiz modelleri canlı model listesiyle kesiştir.
-          #
-          # Endpoint herhangi bir nedenle çalışmazsa Models.dev listesine
-          # geri düşüyoruz.
           echo
-          echo "Checking live OpenCode Zen model endpoint..."
+          echo "========================================"
+          echo "3. ASK OPENCODE WHAT IS KEYLESS/AVAILABLE"
+          echo "========================================"
 
-          if curl \
-              --fail \
-              --silent \
-              --show-error \
-              --location \
-              --retry 2 \
-              --connect-timeout 10 \
-              --max-time 20 \
-              "https://opencode.ai/zen/v1/models" \
-              -o "$RUNNER_TEMP/zen-models.json" \
-            && jq -e '.data | type == "array"' \
-                 "$RUNNER_TEMP/zen-models.json" >/dev/null 2>&1
-          then
-            jq -r '.data[].id' \
-              "$RUNNER_TEMP/zen-models.json" \
-              | sort -u \
-              > "$LIVE"
+          # Yeni, boş bir HOME kullan:
+          # GitHub runner üzerinde eski auth/config bulunmasın.
+          export HOME="$RUNNER_TEMP/discovery-home"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/discovery-config"
+          export XDG_DATA_HOME="$RUNNER_TEMP/discovery-data"
+          export XDG_CACHE_HOME="$RUNNER_TEMP/discovery-cache"
 
-            # FREE listesinin öncelik sırasını koruyarak
-            # sadece Zen endpointinde halen bulunan modelleri tut.
+          mkdir -p \
+            "$HOME" \
+            "$XDG_CONFIG_HOME" \
+            "$XDG_DATA_HOME" \
+            "$XDG_CACHE_HOME"
+
+          unset OPENCODE_API_KEY || true
+
+          if opencode models --standalone > "$AVAILABLE_FULL" 2>&1; then
+            echo "OpenCode model discovery succeeded."
+          else
+            echo "OpenCode model discovery returned non-zero."
+            echo "Will fall back to Models.dev candidates."
+          fi
+
+          echo
+          echo "Raw OpenCode models:"
+          cat "$AVAILABLE_FULL" || true
+
+          # Beklenen satır:
+          # opencode/mimo-v2.6-flash-free
+          #
+          # Sadece opencode provider'ını al ve provider prefix'ini kaldır.
+          sed -n \
+            -E 's/^[[:space:]]*opencode\/([^[:space:]]+).*$/\1/p' \
+            "$AVAILABLE_FULL" \
+            | sort -u \
+            > "$AVAILABLE"
+
+          echo
+          echo "========================================"
+          echo "4. INTERSECT FREE + KEYLESS"
+          echo "========================================"
+
+          if [ -s "$AVAILABLE" ]; then
+
+            # FREE dosyasındaki öncelik sırasını koru.
             awk '
               NR == FNR {
-                live[$0] = 1
+                available[$0] = 1
                 next
               }
 
-              live[$0] {
+              available[$0] {
                 print
               }
-            ' "$LIVE" "$FREE" > "$CANDIDATES"
+            ' "$AVAILABLE" "$FREE" > "$CANDIDATES"
 
-            if [ ! -s "$CANDIDATES" ]; then
-              echo "Live intersection empty; using Models.dev list."
-              cp "$FREE" "$CANDIDATES"
-            fi
           else
-            echo "Zen /models endpoint unavailable."
-            echo "Using Models.dev list directly."
+            echo "Could not obtain OpenCode keyless model list."
+            echo "Using zero-cost Models.dev list directly."
+
+            cp "$FREE" "$CANDIDATES"
+          fi
+
+          # Intersection boşsa da Models.dev'e fallback.
+          if [ ! -s "$CANDIDATES" ]; then
+            echo "Intersection returned zero models."
+            echo "Using zero-cost Models.dev list directly."
+
             cp "$FREE" "$CANDIDATES"
           fi
 
           echo
           echo "========================================"
-          echo "CANDIDATE MODELS"
+          echo "FINAL CANDIDATES"
           echo "========================================"
 
           nl -ba "$CANDIDATES"
 
+          CANDIDATE_COUNT="$(grep -c . "$CANDIDATES" || true)"
+
+          echo
+          echo "Candidate count: $CANDIDATE_COUNT"
+
+          if [ "$CANDIDATE_COUNT" -eq 0 ]; then
+            echo "::error::No candidate model remains."
+            exit 1
+          fi
+
           echo "file=$CANDIDATES" >> "$GITHUB_OUTPUT"
 
-      - name: Run keyless OpenCode smoke test
+      - name: Run keyless free-model smoke test
         shell: bash
         env:
+          NO_COLOR: "1"
+
           MODEL_FILE: ${{ steps.models.outputs.file }}
 
-          # Küçük test olduğu için sonsuza kadar model denemiyoruz.
-          MAX_MODELS: "12"
-          PER_MODEL_TIMEOUT: "45"
+          # Küçük test.
+          MAX_MODELS: "15"
+          PER_MODEL_TIMEOUT: "60"
 
-          # Tamamen temiz/keyless bir OpenCode ortamı.
-          HOME: ${{ runner.temp }}/opencode-home
-          XDG_CONFIG_HOME: ${{ runner.temp }}/opencode-config
-          XDG_DATA_HOME: ${{ runner.temp }}/opencode-data
-          XDG_CACHE_HOME: ${{ runner.temp }}/opencode-cache
+          # Tamamen temiz OpenCode ortamı.
+          HOME: ${{ runner.temp }}/test-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/test-config
+          XDG_DATA_HOME: ${{ runner.temp }}/test-data
+          XDG_CACHE_HOME: ${{ runner.temp }}/test-cache
 
         run: |
           set -uo pipefail
@@ -226,16 +262,22 @@ jobs:
             "$XDG_DATA_HOME" \
             "$XDG_CACHE_HOME"
 
-          # Her ihtimale karşı açıkça kaldır.
           unset OPENCODE_API_KEY || true
 
+          # Repoya bile ihtiyacımız yok.
+          TEST_DIR="$RUNNER_TEMP/opencode-smoke-project"
+
+          mkdir -p "$TEST_DIR"
+          cd "$TEST_DIR"
+
+          echo "OpenCode smoke test" > README.md
+
           echo "========================================"
-          echo "KEYLESS TEST"
+          echo "KEYLESS SMOKE TEST"
           echo "========================================"
           echo "API key: NONE"
-          echo "Max models: $MAX_MODELS"
+          echo "Maximum attempts: $MAX_MODELS"
           echo "Timeout/model: ${PER_MODEL_TIMEOUT}s"
-          echo
 
           ATTEMPT=0
           SUCCESS=0
@@ -248,7 +290,7 @@ jobs:
 
             if [ "$ATTEMPT" -gt "$MAX_MODELS" ]; then
               echo
-              echo "Reached MAX_MODELS=$MAX_MODELS."
+              echo "Maximum attempt count reached."
               break
             fi
 
@@ -256,16 +298,16 @@ jobs:
 
             echo
             echo "========================================"
-            echo "Attempt $ATTEMPT"
-            echo "Model: $FULL_MODEL"
+            echo "ATTEMPT $ATTEMPT"
+            echo "MODEL: $FULL_MODEL"
             echo "========================================"
 
-            # if bloğu önemli:
-            # GitHub'ın bash -e davranışı ilk başarısız modelde
-            # fallback zincirini öldürmesin.
+            # GitHub'ın implicit bash -e davranışının fallback
+            # zincirini öldürmemesi için komut if içinde.
             if OUTPUT="$(
               timeout "${PER_MODEL_TIMEOUT}s" \
                 opencode run \
+                --standalone \
                 --model "$FULL_MODEL" \
                 "Reply with exactly OPENCODE_OK and nothing else." \
                 2>&1
@@ -278,7 +320,8 @@ jobs:
 
             echo "$OUTPUT"
 
-            if [ "$STATUS" -eq 0 ] \
+            if \
+              [ "$STATUS" -eq 0 ] \
               && grep -Fq "OPENCODE_OK" <<< "$OUTPUT"
             then
               SUCCESS=1
@@ -286,19 +329,19 @@ jobs:
 
               echo
               echo "========================================"
-              echo "SUCCESS"
+              echo "✅ SUCCESS"
               echo "========================================"
               echo "Model: $WINNER"
               echo "API key: NONE"
-              echo "Response contains: OPENCODE_OK"
+              echo "Attempts: $ATTEMPT"
 
               break
             fi
 
             if [ "$STATUS" -eq 124 ]; then
-              echo "TIMEOUT: $FULL_MODEL"
+              echo "⚠️ TIMEOUT: $FULL_MODEL"
             else
-              echo "FAILED: $FULL_MODEL (exit=$STATUS)"
+              echo "⚠️ FAILED: $FULL_MODEL (exit=$STATUS)"
             fi
 
           done < "$MODEL_FILE"
@@ -306,12 +349,13 @@ jobs:
           echo
 
           if [ "$SUCCESS" -eq 1 ]; then
+
             {
-              echo "## ✅ OpenCode keyless smoke test passed"
+              echo "## ✅ OpenCode keyless test passed"
               echo
               echo "- **Model:** \`$WINNER\`"
               echo "- **API key:** none"
-              echo "- **Models.dev:** \$0 input / \$0 output"
+              echo "- **Cost filter:** all numeric cost fields = \$0"
               echo "- **Attempts:** $ATTEMPT"
             } >> "$GITHUB_STEP_SUMMARY"
 
@@ -319,15 +363,15 @@ jobs:
           fi
 
           {
-            echo "## ❌ OpenCode keyless smoke test failed"
+            echo "## ❌ OpenCode keyless test failed"
             echo
-            echo "No discovered zero-cost model completed the smoke test."
+            echo "No zero-cost candidate produced OPENCODE_OK."
             echo
-            echo "- API key was not configured."
-            echo "- Models attempted: $ATTEMPT"
+            echo "- **API key:** none"
+            echo "- **Attempts:** $ATTEMPT"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "::error::No discovered keyless free model completed the smoke test."
+          echo "::error::No zero-cost keyless model passed the smoke test."
           exit 1
 
       - name: Cleanup
@@ -336,11 +380,16 @@ jobs:
         run: |
           rm -rf \
             "$RUNNER_TEMP/models-dev.json" \
-            "$RUNNER_TEMP/zen-models.json" \
             "$RUNNER_TEMP/free-models.txt" \
-            "$RUNNER_TEMP/live-models.txt" \
+            "$RUNNER_TEMP/opencode-models.txt" \
+            "$RUNNER_TEMP/opencode-model-ids.txt" \
             "$RUNNER_TEMP/candidates.txt" \
-            "$RUNNER_TEMP/opencode-home" \
-            "$RUNNER_TEMP/opencode-config" \
-            "$RUNNER_TEMP/opencode-data" \
-            "$RUNNER_TEMP/opencode-cache"
+            "$RUNNER_TEMP/discovery-home" \
+            "$RUNNER_TEMP/discovery-config" \
+            "$RUNNER_TEMP/discovery-data" \
+            "$RUNNER_TEMP/discovery-cache" \
+            "$RUNNER_TEMP/test-home" \
+            "$RUNNER_TEMP/test-config" \
+            "$RUNNER_TEMP/test-data" \
+            "$RUNNER_TEMP/test-cache" \
+            "$RUNNER_TEMP/opencode-smoke-project"
