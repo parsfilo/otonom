@@ -1,0 +1,76 @@
+name: OpenCode Free Smoke Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  opencode-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install latest OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm install --global @opencode/cli@latest
+
+          echo "OpenCode:"
+          opencode --version
+
+      - name: Show available OpenCode models
+        shell: bash
+        run: |
+          set -euo pipefail
+          opencode models opencode --refresh || true
+
+      - name: Test free model without API key
+        shell: bash
+        run: |
+          set -u
+
+          MODELS=(
+            "opencode/deepseek-v4-flash-free"
+            "opencode/hy3-free"
+            "opencode/mimo-v2.5-free"
+            "opencode/big-pickle"
+          )
+
+          for MODEL in "${MODELS[@]}"; do
+            echo "========================================"
+            echo "Testing: $MODEL"
+            echo "========================================"
+
+            OUTPUT="$(
+              timeout 90s opencode run \
+                --standalone \
+                --model "$MODEL" \
+                "Reply with exactly OPENCODE_OK and nothing else." \
+                2>&1
+            )"
+
+            STATUS=$?
+
+            echo "$OUTPUT"
+
+            if [ "$STATUS" -eq 0 ] && grep -Fq "OPENCODE_OK" <<< "$OUTPUT"; then
+              echo ""
+              echo "✅ SUCCESS"
+              echo "Model: $MODEL"
+              echo "No API key was used."
+              exit 0
+            fi
+
+            echo "⚠️ $MODEL failed, trying next free model..."
+            echo ""
+          done
+
+          echo "::error::All free OpenCode models failed"
+          exit 1
