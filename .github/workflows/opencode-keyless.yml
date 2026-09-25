@@ -1,0 +1,346 @@
+name: OpenCode Keyless Free Model Test
+
+on:
+  workflow_dispatch:
+
+# GitHub token'a bile ihtiyacımız yok.
+permissions: {}
+
+jobs:
+  opencode-test:
+    name: OpenCode Keyless Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Install latest OpenCode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm install --global @opencode/cli@latest
+
+          echo "========================================"
+          echo "OpenCode version"
+          echo "========================================"
+          opencode --version
+
+          echo
+          echo "Node:"
+          node --version
+
+          echo
+          echo "jq:"
+          jq --version
+
+      - name: Discover current free OpenCode models
+        id: models
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CATALOG="$RUNNER_TEMP/models-dev.json"
+          FREE="$RUNNER_TEMP/free-models.txt"
+          LIVE="$RUNNER_TEMP/live-models.txt"
+          CANDIDATES="$RUNNER_TEMP/candidates.txt"
+
+          echo "Downloading current Models.dev catalog..."
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "https://models.dev/api.json?type=all" \
+            -o "$CATALOG"
+
+          # API yapısının beklediğimiz formatta olduğunu doğrula.
+          jq -e '
+            .opencode.models
+            | type == "object"
+          ' "$CATALOG" >/dev/null
+
+          # Yalnızca:
+          #
+          # - OpenCode Zen modelleri
+          # - input = $0
+          # - output = $0
+          # - cost içindeki diğer sayısal alanlar da $0
+          # - deprecated olmayan
+          # - text output verebilen
+          # - özel "decision" modeli olmayan
+          #
+          # modelleri seç.
+          #
+          # Tool-call destekleyen ve context'i yüksek modeller önce gelir.
+          jq -r '
+            .opencode.models
+            | to_entries
+
+            | map(
+                select(
+                  (.value.cost.input? == 0)
+                  and
+                  (.value.cost.output? == 0)
+                  and
+                  (
+                    [.value.cost.. | numbers]
+                    | all(. == 0)
+                  )
+                  and
+                  (
+                    (.value.status? // "active")
+                    != "deprecated"
+                  )
+                  and
+                  (
+                    (.value.type? // "")
+                    != "decision"
+                  )
+                  and
+                  (
+                    (
+                      .value.modalities.output?
+                      // ["text"]
+                    )
+                    | index("text") != null
+                  )
+                )
+              )
+
+            | sort_by(
+                [
+                  (
+                    if (.value.tool_call? // false)
+                    then 0
+                    else 1
+                    end
+                  ),
+                  -(.value.limit.context? // 0)
+                ]
+              )
+
+            | .[].key
+          ' "$CATALOG" > "$FREE"
+
+          echo
+          echo "========================================"
+          echo "FREE MODELS FROM MODELS.DEV"
+          echo "========================================"
+
+          nl -ba "$FREE"
+
+          FREE_COUNT="$(wc -l < "$FREE" | tr -d ' ')"
+
+          echo
+          echo "Free model count: $FREE_COUNT"
+
+          if [ "$FREE_COUNT" -eq 0 ]; then
+            echo "::error::Models.dev returned no zero-cost OpenCode models."
+            exit 1
+          fi
+
+          # Zen'in canlı /models endpointi açıksa,
+          # katalogdaki ücretsiz modelleri canlı model listesiyle kesiştir.
+          #
+          # Endpoint herhangi bir nedenle çalışmazsa Models.dev listesine
+          # geri düşüyoruz.
+          echo
+          echo "Checking live OpenCode Zen model endpoint..."
+
+          if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 2 \
+              --connect-timeout 10 \
+              --max-time 20 \
+              "https://opencode.ai/zen/v1/models" \
+              -o "$RUNNER_TEMP/zen-models.json" \
+            && jq -e '.data | type == "array"' \
+                 "$RUNNER_TEMP/zen-models.json" >/dev/null 2>&1
+          then
+            jq -r '.data[].id' \
+              "$RUNNER_TEMP/zen-models.json" \
+              | sort -u \
+              > "$LIVE"
+
+            # FREE listesinin öncelik sırasını koruyarak
+            # sadece Zen endpointinde halen bulunan modelleri tut.
+            awk '
+              NR == FNR {
+                live[$0] = 1
+                next
+              }
+
+              live[$0] {
+                print
+              }
+            ' "$LIVE" "$FREE" > "$CANDIDATES"
+
+            if [ ! -s "$CANDIDATES" ]; then
+              echo "Live intersection empty; using Models.dev list."
+              cp "$FREE" "$CANDIDATES"
+            fi
+          else
+            echo "Zen /models endpoint unavailable."
+            echo "Using Models.dev list directly."
+            cp "$FREE" "$CANDIDATES"
+          fi
+
+          echo
+          echo "========================================"
+          echo "CANDIDATE MODELS"
+          echo "========================================"
+
+          nl -ba "$CANDIDATES"
+
+          echo "file=$CANDIDATES" >> "$GITHUB_OUTPUT"
+
+      - name: Run keyless OpenCode smoke test
+        shell: bash
+        env:
+          MODEL_FILE: ${{ steps.models.outputs.file }}
+
+          # Küçük test olduğu için sonsuza kadar model denemiyoruz.
+          MAX_MODELS: "12"
+          PER_MODEL_TIMEOUT: "45"
+
+          # Tamamen temiz/keyless bir OpenCode ortamı.
+          HOME: ${{ runner.temp }}/opencode-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/opencode-config
+          XDG_DATA_HOME: ${{ runner.temp }}/opencode-data
+          XDG_CACHE_HOME: ${{ runner.temp }}/opencode-cache
+
+        run: |
+          set -uo pipefail
+
+          mkdir -p \
+            "$HOME" \
+            "$XDG_CONFIG_HOME" \
+            "$XDG_DATA_HOME" \
+            "$XDG_CACHE_HOME"
+
+          # Her ihtimale karşı açıkça kaldır.
+          unset OPENCODE_API_KEY || true
+
+          echo "========================================"
+          echo "KEYLESS TEST"
+          echo "========================================"
+          echo "API key: NONE"
+          echo "Max models: $MAX_MODELS"
+          echo "Timeout/model: ${PER_MODEL_TIMEOUT}s"
+          echo
+
+          ATTEMPT=0
+          SUCCESS=0
+          WINNER=""
+
+          while IFS= read -r MODEL; do
+            [ -n "$MODEL" ] || continue
+
+            ATTEMPT=$((ATTEMPT + 1))
+
+            if [ "$ATTEMPT" -gt "$MAX_MODELS" ]; then
+              echo
+              echo "Reached MAX_MODELS=$MAX_MODELS."
+              break
+            fi
+
+            FULL_MODEL="opencode/$MODEL"
+
+            echo
+            echo "========================================"
+            echo "Attempt $ATTEMPT"
+            echo "Model: $FULL_MODEL"
+            echo "========================================"
+
+            # if bloğu önemli:
+            # GitHub'ın bash -e davranışı ilk başarısız modelde
+            # fallback zincirini öldürmesin.
+            if OUTPUT="$(
+              timeout "${PER_MODEL_TIMEOUT}s" \
+                opencode run \
+                --model "$FULL_MODEL" \
+                "Reply with exactly OPENCODE_OK and nothing else." \
+                2>&1
+            )"
+            then
+              STATUS=0
+            else
+              STATUS=$?
+            fi
+
+            echo "$OUTPUT"
+
+            if [ "$STATUS" -eq 0 ] \
+              && grep -Fq "OPENCODE_OK" <<< "$OUTPUT"
+            then
+              SUCCESS=1
+              WINNER="$FULL_MODEL"
+
+              echo
+              echo "========================================"
+              echo "SUCCESS"
+              echo "========================================"
+              echo "Model: $WINNER"
+              echo "API key: NONE"
+              echo "Response contains: OPENCODE_OK"
+
+              break
+            fi
+
+            if [ "$STATUS" -eq 124 ]; then
+              echo "TIMEOUT: $FULL_MODEL"
+            else
+              echo "FAILED: $FULL_MODEL (exit=$STATUS)"
+            fi
+
+          done < "$MODEL_FILE"
+
+          echo
+
+          if [ "$SUCCESS" -eq 1 ]; then
+            {
+              echo "## ✅ OpenCode keyless smoke test passed"
+              echo
+              echo "- **Model:** \`$WINNER\`"
+              echo "- **API key:** none"
+              echo "- **Models.dev:** \$0 input / \$0 output"
+              echo "- **Attempts:** $ATTEMPT"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            exit 0
+          fi
+
+          {
+            echo "## ❌ OpenCode keyless smoke test failed"
+            echo
+            echo "No discovered zero-cost model completed the smoke test."
+            echo
+            echo "- API key was not configured."
+            echo "- Models attempted: $ATTEMPT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error::No discovered keyless free model completed the smoke test."
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf \
+            "$RUNNER_TEMP/models-dev.json" \
+            "$RUNNER_TEMP/zen-models.json" \
+            "$RUNNER_TEMP/free-models.txt" \
+            "$RUNNER_TEMP/live-models.txt" \
+            "$RUNNER_TEMP/candidates.txt" \
+            "$RUNNER_TEMP/opencode-home" \
+            "$RUNNER_TEMP/opencode-config" \
+            "$RUNNER_TEMP/opencode-data" \
+            "$RUNNER_TEMP/opencode-cache"
